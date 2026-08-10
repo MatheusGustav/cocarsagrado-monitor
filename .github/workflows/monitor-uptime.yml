@@ -1,0 +1,87 @@
+name: Monitor de uptime (site novo)
+
+# Dá um ping no site a cada 5 min e avisa no Telegram só quando o status
+# MUDA (cai ou volta) — evita repetir alerta a cada rodada enquanto o site
+# estiver fora do ar.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Duas rodadas sobrepostas brigariam no push do arquivo de status.
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      URL: https://cocarsagrado.com.br
+      STATUS_FILE: .uptime-status
+      HEARTBEAT_FILE: .heartbeat
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Testa o site (3 tentativas)
+        id: check
+        run: |
+          up="false"
+          for i in 1 2 3; do
+            codigo=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$URL" || echo "000")
+            if [ "$codigo" = "200" ]; then
+              up="true"
+              break
+            fi
+            sleep 15
+          done
+          echo "up=$up" >> "$GITHUB_OUTPUT"
+
+      - name: Avisa no Telegram se o status mudou e grava o estado
+        run: |
+          atual="down"
+          [ "${{ steps.check.outputs.up }}" = "true" ] && atual="up"
+
+          anterior="up"
+          [ -f "$STATUS_FILE" ] && anterior=$(cat "$STATUS_FILE")
+
+          if [ "$atual" != "$anterior" ]; then
+            agora=$(date -u '+%d/%m %H:%M UTC')
+            if [ "$atual" = "down" ]; then
+              texto="🔴 cocarsagrado.com.br fora do ar (sem resposta 200 em 3 tentativas) — $agora"
+            else
+              texto="✅ cocarsagrado.com.br voltou ao ar — $agora"
+            fi
+
+            # --fail: se o Telegram recusar, o passo falha ANTES de gravar o
+            # status — a próxima rodada tenta avisar de novo em vez de perder
+            # o alerta pra sempre.
+            curl -s --fail -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              -d text="$texto" > /dev/null
+
+            echo "$atual" > "$STATUS_FILE"
+          else
+            echo "Sem mudança de status ($atual)."
+          fi
+
+          # Sem commit por 60 dias o GitHub desliga o cron sozinho (mesma
+          # pegadinha dos workflows de backup) — um commit por dia mantém
+          # o agendamento vivo.
+          date -u +%Y-%m-%d > "$HEARTBEAT_FILE"
+
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$STATUS_FILE" "$HEARTBEAT_FILE"
+            git commit -m "monitor: status=$atual — $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git pull --rebase
+            git push
+          fi
